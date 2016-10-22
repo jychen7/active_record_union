@@ -18,30 +18,41 @@ module ActiveRecord
       private
 
       def set_operation(operation, relation_or_where_arg, *args)
-        other = if args.size == 0 && Relation === relation_or_where_arg
-                  relation_or_where_arg
+        # https://github.com/brianhempel/active_record_union/pull/4/files
+        # looks like this PR is good, it can support flat union
+        others = if Relation === relation_or_where_arg
+                  [relation_or_where_arg, *args]
                 else
-                  @klass.where(relation_or_where_arg, *args)
+                  [@klass.where(relation_or_where_arg, *args)]
                 end
 
-        verify_relations_for_set_operation!(operation, self, other)
+        verify_relations_for_set_operation!(operation, self, *others)
 
         # Postgres allows ORDER BY in the UNION subqueries if each subquery is surrounded by parenthesis
         # but SQLite does not allow parens around the subqueries; you will have to explicitly do `relation.reorder(nil)` in SQLite
-        if Arel::Visitors::SQLite === self.connection.visitor
-          left, right = self.ast, other.ast
+        queries = if Arel::Visitors::SQLite === self.connection.visitor
+          [self.ast, *others.map(&:ast)]
         else
-          left, right = Arel::Nodes::Grouping.new(self.ast), Arel::Nodes::Grouping.new(other.ast)
+          [Arel::Nodes::Grouping.new(self.ast), *others.map{|other| Arel::Nodes::Grouping.new(other.ast)}]
         end
 
-        set  = SET_OPERATION_TO_AREL_CLASS[operation].new(left, right)
+        arel_class = SET_OPERATION_TO_AREL_CLASS[operation]
+        set = queries.reduce { |left, right| arel_class.new(left, right) }
         from = Arel::Nodes::TableAlias.new(set, @klass.arel_table.name)
         if ActiveRecord::VERSION::MAJOR >= 5
           relation             = @klass.unscoped.spawn
-          relation.from_clause = UnionFromClause.new(from, nil, self.bound_attributes + other.bound_attributes)
+          relation.from_clause = UnionFromClause.new(from, nil, self.bound_attributes + others.map(&:bound_attributes))
         else
           relation             = @klass.unscoped.from(from)
-          relation.bind_values = self.arel.bind_values + self.bind_values + other.arel.bind_values + other.bind_values
+          # self.arel.bind_values was add in following PR
+          # https://github.com/brianhempel/active_record_union/pull/7/files
+          # however, AR 3.2.xxx or Arel 3.0.3 doesn't have binding_values in Arel::TreeManager
+          # https://github.com/rails/arel/blob/v3.0.3/lib/arel/tree_manager.rb
+          # I can't reproduce the bug in that PR mentioned, so I add responde_to checking first
+          relation.bind_values = (self.arel.respond_to?(:binding_values) ? self.arel.bind_values : [])
+          relation.bind_values += self.bind_values
+          relation.bind_values += others.map{|other| other.arel.respond_to?(:binding_values) ? other.arel.bind_values : []}.flatten
+          relation.bind_values += others.map(&:bind_values).flatten
         end
         relation
       end
@@ -76,6 +87,6 @@ module ActiveRecord
           end
         end
       end
-    end
-  end
-end
+    end # Union
+  end # Relation
+end # ActiveRecord
